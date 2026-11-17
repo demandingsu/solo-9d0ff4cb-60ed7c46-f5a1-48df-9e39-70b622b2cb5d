@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 
 from . import db
 from .engine import Calibration, ComputeError, Reading, compute_day
@@ -167,6 +168,23 @@ def _validate_interval(start: int, end: int) -> None:
         )
 
 
+def _require_finite_offset(offset_c: object) -> float:
+    """Reject non-finite certificate offsets (NaN / +Infinity / -Infinity).
+
+    Must run *before* any write transaction so a rejected certificate leaves
+    the stored certificate, ``data_version`` and stale flags untouched.
+    """
+    if isinstance(offset_c, bool) or not isinstance(offset_c, (int, float)):
+        raise ServiceError("温度偏移必须是有限数值")
+    value = float(offset_c)
+    if not math.isfinite(value):
+        raise ServiceError(
+            "温度偏移必须是有限数值，拒绝 NaN / Infinity / -Infinity；"
+            "请先修正证书后再发布"
+        )
+    return value
+
+
 def _check_no_overlap(
     conn, probe_id: str, start: int, end: int, exclude_id: int | None = None
 ) -> None:
@@ -193,8 +211,7 @@ def add_certificate(
     if not probe_id or not str(probe_id).strip():
         raise ServiceError("探头号不能为空")
     _validate_interval(valid_from, valid_to)
-    if not isinstance(offset_c, (int, float)) or offset_c != offset_c:
-        raise ServiceError("温度偏移必须是有限数值")
+    offset = _require_finite_offset(offset_c)
 
     with db.write_tx() as conn:
         _check_no_overlap(conn, probe_id, valid_from, valid_to)
@@ -202,7 +219,7 @@ def add_certificate(
         cur = conn.execute(
             "INSERT INTO calibrations(probe_id, valid_from, valid_to, offset_c, data_version) "
             "VALUES (?, ?, ?, ?, ?)",
-            (probe_id, valid_from, valid_to, float(offset_c), version),
+            (probe_id, valid_from, valid_to, offset, version),
         )
         cert_id = cur.lastrowid
         days = db.stale_days_for_span(conn, probe_id, valid_from, valid_to)
@@ -222,6 +239,12 @@ def update_certificate(
     valid_to: int | None = None,
     offset_c: float | None = None,
 ) -> dict:
+    # Validate a supplied offset before opening the write transaction so a
+    # rejected PATCH leaves the original certificate, version and stale flags
+    # exactly as they were.
+    if offset_c is not None:
+        _require_finite_offset(offset_c)
+
     with db.write_tx() as conn:
         row = conn.execute(
             "SELECT * FROM calibrations WHERE id = ?", (cert_id,)
@@ -231,10 +254,19 @@ def update_certificate(
 
         new_from = row["valid_from"] if valid_from is None else valid_from
         new_to = row["valid_to"] if valid_to is None else valid_to
-        new_offset = row["offset_c"] if offset_c is None else offset_c
+        # A legacy non-finite stored offset must be replaced with a finite one;
+        # keeping it would keep the certificate polluted. (SQLite round-trips
+        # stored NaN back as NULL, which is treated as polluted as well.)
+        stored_offset = row["offset_c"]
+        stored_polluted = not isinstance(stored_offset, (int, float)) or not math.isfinite(
+            float(stored_offset)
+        )
+        if offset_c is None and stored_polluted:
+            raise ServiceError(
+                f"证书 #{cert_id} 当前偏移为非有限污染值，PATCH 必须提供有限的 offset_c"
+            )
+        new_offset = stored_offset if offset_c is None else float(offset_c)
         _validate_interval(new_from, new_to)
-        if new_offset != new_offset:
-            raise ServiceError("温度偏移必须是有限数值")
         _check_no_overlap(
             conn, row["probe_id"], new_from, new_to, exclude_id=cert_id
         )
@@ -248,8 +280,8 @@ def update_certificate(
         version = db.bump_version(conn)
         conn.execute(
             "UPDATE calibrations SET valid_from = ?, valid_to = ?, "
-            "offset_c = ?, data_version = ? WHERE id = ?",
-            (new_from, new_to, float(new_offset), version, cert_id),
+            "offset_c = ?, data_version = ?, quarantine_reason = NULL WHERE id = ?",
+            (new_from, new_to, new_offset, version, cert_id),
         )
         new_days = set(
             db.stale_days_for_span(conn, row["probe_id"], new_from, new_to)
@@ -353,6 +385,17 @@ def publish_day(probe_id: str, day: int) -> dict:
             raise ServiceError(f"重算失败: {exc}", status_code=500) from exc
         payload["data_version"] = version
 
+        # Serialize with allow_nan=False *before* touching the previous
+        # publication: a non-finite result (overflow / polluted snapshot) must
+        # never replace the last readable row. The engine already guards this,
+        # this is the serialization-level backstop.
+        try:
+            payload_text = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        except ValueError as exc:
+            raise ServiceError(
+                f"重算失败: 发布内容含非有限数值，拒绝写入: {exc}", status_code=500
+            ) from exc
+
         # Replace the currently served version atomically.
         conn.execute(
             "UPDATE publications SET status = 'superseded' "
@@ -362,7 +405,7 @@ def publish_day(probe_id: str, day: int) -> dict:
         cur = conn.execute(
             "INSERT INTO publications(probe_id, day, data_version, status, payload) "
             "VALUES (?, ?, ?, 'serving', ?)",
-            (probe_id, day, version, json.dumps(payload, ensure_ascii=False)),
+            (probe_id, day, version, payload_text),
         )
         return {
             "status": "serving",

@@ -43,6 +43,13 @@
   .badge.serving { background: #dcfce7; color: var(--green); }
   .badge.stale { background: #fee2e2; color: var(--red); }
   .badge.superseded { background: #fef3c7; color: var(--amber); }
+  .badge.quarantined { background: #1f2937; color: #fca5a5; border: 1px solid var(--red); }
+  .badge.polluted { background: #fee2e2; color: var(--red); border: 1px solid var(--red); }
+  .badge.clean { background: #dcfce7; color: var(--green); }
+  .qbox { border: 1px solid var(--red); border-radius: 8px; padding: 10px 12px; margin-top: 10px;
+          background: #fff7f7; }
+  .qbox h3 { margin: 0 0 8px; font-size: 13px; color: var(--red); }
+  .qreason { color: var(--red); font-size: 12px; margin-top: 4px; line-height: 1.5; }
   pre.out { background: #0f172a; color: #d1fae5; padding: 10px; border-radius: 8px;
             font-size: 12px; overflow: auto; max-height: 260px; margin: 10px 0 0; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
@@ -61,7 +68,8 @@
 <body>
 <header>
   <h1>冷链探头校准数据集</h1>
-  <span class="meta">FastAPI + SQLite · 时间均为 UTC · 当前数据版本：<b id="dataVersion">…</b></span>
+  <span class="meta">FastAPI + SQLite · 时间均为 UTC · 当前数据版本：<b id="dataVersion">…</b>
+    · 污染隔离：<b id="quarantineCount">…</b></span>
   <button class="ghost" id="refreshMeta" style="margin-top:0">刷新状态</button>
 </header>
 
@@ -125,6 +133,18 @@ P-01,28801,8.6"></textarea>
     </div>
     <div id="pubTable"></div>
   </section>
+
+  <!-- 5. 污染隔离报告 -->
+  <section class="card wide">
+    <h2>5. 污染隔离报告<span class="tag">非有限值（NaN/Infinity）证书与发布版；隔离版不得作为有效供数</span></h2>
+    <div class="row">
+      <div style="flex:0"><button class="secondary" id="btnQuarantine">刷新污染报告</button></div>
+    </div>
+    <div class="hint">启动时自动扫描旧库：含非有限偏移的证书、含非有限温度（或无法解析）的发布版会被隔离，
+      并从“供数中”移除；若存在更早的有效发布，它会恢复为可查询的“已过期”旧版。
+      修正证书（PATCH 有限偏移）后对该探头×日重新发布，即可恢复供数，有效历史保留。</div>
+    <div id="quarantineBox"><p class="muted">尚未加载…</p></div>
+  </section>
 </main>
 
 <script>
@@ -149,6 +169,9 @@ async function refreshMeta() {
   try {
     const h = await call("/health");
     $("dataVersion").textContent = h.data_version;
+    const qn = (h.quarantined_certificates || 0) + (h.quarantined_publications || 0);
+    $("quarantineCount").textContent = qn === 0 ? "无" : (qn + " 项（见第 5 区）");
+    $("quarantineCount").style.color = qn === 0 ? "#86efac" : "#fca5a5";
   } catch (e) { $("dataVersion").textContent = "不可用"; }
 }
 
@@ -173,14 +196,19 @@ $("btnImport").onclick = async () => {
 
 // ---------- 2. 证书 ----------
 $("btnAddCert").onclick = async () => {
+  const offset = parseFloat($("certOffset").value);
+  if (!Number.isFinite(offset)) {
+    out("certOut", "新增失败：偏移必须是有限数值（拒绝 NaN/Infinity），数据未改动。", true);
+    return;
+  }
   try {
     const r = await jsonPost("/api/certificates", {
       probe_id: $("certProbe").value.trim(),
       valid_from: $("certFrom").value.trim(),
       valid_to: $("certTo").value.trim(),
-      offset_c: parseFloat($("certOffset").value)
+      offset_c: offset
     });
-    out("certOut", r); await refreshMeta(); loadCerts($("certProbe").value.trim());
+    out("certOut", r); await refreshMeta(); loadCerts($("certProbe").value.trim()); loadQuarantine();
   } catch (e) { out("certOut", "新增失败（数据未改动）: " + e.message, true); }
 };
 $("btnListCert").onclick = () => loadCerts($("certProbe").value.trim());
@@ -190,12 +218,14 @@ async function loadCerts(probe) {
   const r = await call(url);
   if (!r.count) { $("certTable").innerHTML = '<p class="muted">暂无证书</p>'; return; }
   $("certTable").innerHTML = "<table><tr><th>ID</th><th>探头</th><th>有效期 [from, to)</th>" +
-    "<th>偏移℃</th><th>版本</th><th>操作</th></tr>" +
-    r.certificates.map(c => `<tr>
+    "<th>偏移℃</th><th>版本</th><th>状态/操作</th></tr>" +
+    r.certificates.map(c => `<tr${c.quarantined ? ' style="background:#fff7f7"' : ""}>
       <td>${c.id}</td><td>${c.probe_id}</td>
       <td class="mono">${c.valid_from_iso}<br>→ ${c.valid_to_iso}<br>(${c.valid_from}–${c.valid_to})</td>
-      <td>${c.offset_c}</td><td>v${c.data_version}</td>
+      <td class="mono">${c.offset_c}${c.quarantined ? ' <span class="badge polluted">污染</span>' : ""}</td>
+      <td>v${c.data_version}</td>
       <td class="cert-actions">
+        ${c.quarantined ? `<div class="qreason">${c.quarantine_reason || ""}<br>须 PATCH 有限偏移修复</div>` : ""}
         <button class="ghost" onclick="editCert(${c.id})">改</button>
         <button class="danger" onclick="delCert(${c.id})">删</button>
       </td></tr>`).join("") + "</table>";
@@ -216,12 +246,19 @@ window.editCert = async (id) => {
   const body = {};
   if (from.trim()) body.valid_from = from.trim();
   if (to.trim()) body.valid_to = to.trim();
-  if (off.trim()) body.offset_c = parseFloat(off);
+  if (off.trim()) {
+    const offVal = parseFloat(off);
+    if (!Number.isFinite(offVal)) {
+      out("certOut", "修改失败：偏移必须是有限数值（拒绝 NaN/Infinity），数据未改动。", true);
+      return;
+    }
+    body.offset_c = offVal;
+  }
   try {
     out("certOut", await call("/api/certificates/" + id, {
       method: "PATCH", headers: {"Content-Type": "application/json"},
       body: JSON.stringify(body)}));
-    await refreshMeta(); loadCerts($("certProbe").value.trim());
+    await refreshMeta(); loadCerts($("certProbe").value.trim()); loadQuarantine();
   } catch (e) { out("certOut", "修改失败（数据未改动）: " + e.message, true); }
 };
 
@@ -259,32 +296,81 @@ $("btnQuery").onclick = async () => {
 
 function renderPublications(items) {
   if (!items || !items.length) {
-    $("pubTable").innerHTML = '<p class="muted">没有匹配的已发布版本</p>'; return;
+    $("pubTable").innerHTML = '<p class="muted">没有匹配的有效已发布版本（污染隔离版请见第 5 区或勾选“含历史版本”）</p>'; return;
   }
+  const statusLabel = {serving: "供数中", stale: "已过期", superseded: "被替代", quarantined: "污染隔离"};
   const rows = items.map(it => {
     const p = it.payload;
-    const segs = p.segments.length
-      ? "<table><tr><th>起 UTC</th><th>止 UTC（不含）</th><th>分钟数</th><th>峰值℃</th></tr>" +
-        p.segments.map(s => `<tr><td class="mono">${s.start_utc}</td><td class="mono">${s.end_utc}</td>
-          <td>${s.duration_minutes}</td><td>${s.max_calibrated_c}</td></tr>`).join("") + "</table>"
-      : '<span class="seg-empty">无超温连续时段</span>';
-    const uncal = p.uncalibrated_minutes_utc.length
-      ? `<div class="uncal">有读数却未校准（${p.uncalibrated_minutes_utc.length} 分钟，已截断时段）：<br>` +
-        `<span class="mono">${p.uncalibrated_minutes_utc.join(", ")}</span></div>`
-      : '<span class="muted">全部读数均在证书有效期内</span>';
-    return `<tr>
-      <td>${it.publication_id}<br><span class="badge ${it.status}">${
-          {serving: "供数中", stale: "已过期", superseded: "被替代"}[it.status]}</span></td>
+    let body;
+    if (p === null || p === undefined) {
+      body = '<div class="qreason">payload 无法解析，内容不可读（见隔离原因）</div>';
+    } else {
+      const segs = p.segments.length
+        ? "<table><tr><th>起 UTC</th><th>止 UTC（不含）</th><th>分钟数</th><th>峰值℃</th></tr>" +
+          p.segments.map(s => `<tr><td class="mono">${s.start_utc}</td><td class="mono">${s.end_utc}</td>
+            <td>${s.duration_minutes}</td><td>${s.max_calibrated_c}</td></tr>`).join("") + "</table>"
+        : '<span class="seg-empty">无超温连续时段</span>';
+      const uncal = p.uncalibrated_minutes_utc.length
+        ? `<div class="uncal">有读数却未校准（${p.uncalibrated_minutes_utc.length} 分钟，已截断时段）：<br>` +
+          `<span class="mono">${p.uncalibrated_minutes_utc.join(", ")}</span></div>`
+        : '<span class="muted">全部读数均在证书有效期内</span>';
+      body = segs + uncal;
+    }
+    const qbanner = it.quarantined
+      ? `<div class="qreason">⛔ ${it.quarantine_reason || "该版本已被污染隔离，不作为有效供数"}</div>` : "";
+    return `<tr${it.quarantined ? ' style="background:#fff7f7"' : ""}>
+      <td>${it.publication_id}<br><span class="badge ${it.status}">${statusLabel[it.status] || it.status}</span></td>
       <td>${it.probe_id}</td><td>${it.day_utc}</td><td>v${it.data_version}</td>
-      <td>读数 ${p.total_reading_minutes} 分钟 / 已校准 ${p.calibrated_minutes} 分钟</td>
-      <td>${segs}${uncal}</td>
+      <td>${p ? `读数 ${p.total_reading_minutes} 分钟 / 已校准 ${p.calibrated_minutes} 分钟` : "—"}</td>
+      <td>${qbanner}${body}</td>
     </tr>`;
   }).join("");
   $("pubTable").innerHTML = "<table><tr><th>版本</th><th>探头</th><th>UTC 日</th>" +
     "<th>数据版本</th><th>覆盖</th><th>发布内容</th></tr>" + rows + "</table>";
 }
 
+// ---------- 5. 污染隔离报告 ----------
+$("btnQuarantine").onclick = loadQuarantine;
+
+async function loadQuarantine() {
+  try {
+    const r = await call("/api/quarantine");
+    const box = $("quarantineBox");
+    if (!r.certificate_count && !r.publication_count) {
+      box.innerHTML = '<p class="ok">✔ 库中未发现非有限污染数据。</p>';
+      return;
+    }
+    const certsHtml = r.polluted_certificates.length
+      ? "<h3>污染证书（不得作为校准依据）</h3><table><tr><th>证书 ID</th><th>探头</th>" +
+        "<th>有效期 [from, to)</th><th>偏移</th><th>写入版本</th><th>原因 / 修复</th></tr>" +
+        r.polluted_certificates.map(c => `<tr>
+          <td>${c.id}</td><td>${c.probe_id}</td>
+          <td class="mono">${c.valid_from_iso}<br>→ ${c.valid_to_iso}</td>
+          <td class="mono">${c.offset_c}</td><td>v${c.data_version}</td>
+          <td class="qreason">${c.quarantine_reason}<br>修复：PATCH /api/certificates/${c.id} 提供有限 offset_c</td>
+        </tr>`).join("") + "</table>"
+      : "";
+    const pubsHtml = r.polluted_publications.length
+      ? "<h3>污染发布版（不作为有效供数；更早的有效发布仍可按“已过期”查询）</h3>" +
+        "<table><tr><th>发布 ID</th><th>探头</th><th>UTC 日</th><th>数据版本</th><th>状态</th><th>原因 / 恢复</th></tr>" +
+        r.polluted_publications.map(p => `<tr>
+          <td>${p.publication_id}</td><td>${p.probe_id}</td><td>${p.day_utc}</td>
+          <td>v${p.data_version}</td><td><span class="badge quarantined">${statusLabelPub(p.status)}</span></td>
+          <td class="qreason">${p.quarantine_reason}<br>
+            恢复：修正该探头证书后 POST /api/publications {probe_id:"${p.probe_id}", day:"${p.day_utc}"}</td>
+        </tr>`).join("") + "</table>"
+      : "";
+    box.innerHTML = `<div class="qbox">${certsHtml}${pubsHtml}</div>`;
+  } catch (e) {
+    $("quarantineBox").innerHTML = '<p class="err">污染报告加载失败: ' + e.message + "</p>";
+  }
+}
+function statusLabelPub(s) {
+  return {serving: "供数中", stale: "已过期", superseded: "被替代", quarantined: "污染隔离"}[s] || s;
+}
+
 refreshMeta();
+loadQuarantine();
 </script>
 </body>
 </html>

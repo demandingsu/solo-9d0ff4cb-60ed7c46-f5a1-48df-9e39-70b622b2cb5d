@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -27,14 +28,33 @@ async def lifespan(_: FastAPI):
     yield
 
 
+class StrictJSONResponse(JSONResponse):
+    """JSON response that refuses NaN/Infinity instead of emitting invalid JSON.
+
+    Endpoints are responsible for sanitizing polluted (quarantined) data into
+    readable labels; this class is the last backstop guaranteeing every
+    response body is strict, standards-compliant JSON that a browser can parse.
+    """
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+
 app = FastAPI(
     title="冷链探头校准数据集",
     description=(
         "探头读数导入（同探头同分钟更正替换）、半开非重叠校准证书管理、"
         "按探头/UTC 日发布校准后超温连续时段，并维护版本与过期状态。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
+    default_response_class=StrictJSONResponse,
 )
 
 
@@ -72,9 +92,15 @@ def health() -> dict:
     conn = db.connect()
     try:
         version = db.current_version(conn)
+        report = db.quarantine_report(conn)
+        return {
+            "status": "ok",
+            "data_version": version,
+            "quarantined_certificates": len(report["certificates"]),
+            "quarantined_publications": len(report["publications"]),
+        }
     finally:
         conn.close()
-    return {"status": "ok", "data_version": version}
 
 
 # --------------------------------------------------------------------------- #
@@ -160,14 +186,41 @@ def get_certificates(probe_id: Optional[str] = None) -> dict:
     rows = services.list_certificates(probe_id)
     return {
         "count": len(rows),
-        "certificates": [
-            {
-                **r,
-                "valid_from_iso": minute_to_iso(r["valid_from"]),
-                "valid_to_iso": minute_to_iso(r["valid_to"]),
-            }
-            for r in rows
-        ],
+        "certificates": [_certificate_item(r) for r in rows],
+    }
+
+
+def _finite_or_label(value: Any) -> Any:
+    """Keep finite numbers as-is; render NaN/Infinity/NULL as a readable label.
+
+    The JSON encoder used by FastAPI would otherwise turn non-finite floats
+    (and SQLite-round-tripped NaN, stored as NULL) into ``null`` and silently
+    hide pollution from the UI.
+    """
+    if value is None:
+        return "NULL(原NaN)"
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    return value
+
+
+def _certificate_item(row: dict) -> dict:
+    offset = row["offset_c"]
+    finite = (
+        isinstance(offset, (int, float))
+        and not isinstance(offset, bool)
+        and math.isfinite(float(offset))
+    )
+    return {
+        **row,
+        "valid_from_iso": minute_to_iso(row["valid_from"]),
+        "valid_to_iso": minute_to_iso(row["valid_to"]),
+        "offset_c": _finite_or_label(offset),
+        "finite": finite,
+        "quarantined": row.get("quarantine_reason") is not None,
+        "quarantine_reason": row.get("quarantine_reason"),
     }
 
 
@@ -209,9 +262,11 @@ def query_publications(
 ) -> dict:
     """List the current publication of each (probe, day).
 
-    Defaults to the latest row per pair (serving or stale — a stale row is
-    still the queryable old version until a successful recompute replaces it).
-    With ``include_history=true`` every version row is returned.
+    Defaults to the latest *valid* row per pair (serving or stale — a stale
+    row is still the queryable old version until a successful recompute
+    replaces it). Quarantined (polluted) rows are never valid supply data and
+    are excluded from the current view; with ``include_history=true`` every
+    version row, including quarantined ones, is returned with its reason.
     """
     conn = db.connect()
     try:
@@ -232,11 +287,14 @@ def query_publications(
             ).fetchall()
             items = [_publication_item(r) for r in rows]
         else:
-            # Latest row per (probe, day): its status is serving or stale.
+            # Latest *valid* row per (probe, day): its status is serving or
+            # stale. Quarantined rows are skipped so pollution never serves.
+            filter_clauses = clauses + ["status != 'quarantined'"]
+            valid_where = "WHERE " + " AND ".join(filter_clauses)
             rows = conn.execute(
                 f"SELECT p.* FROM publications p JOIN ("
                 "SELECT probe_id AS pid, day AS d, MAX(id) AS max_id "
-                f"FROM publications {where} GROUP BY probe_id, day"
+                f"FROM publications {valid_where} GROUP BY probe_id, day"
                 ") g ON p.id = g.max_id ORDER BY p.probe_id, p.day",
                 params,
             ).fetchall()
@@ -247,8 +305,31 @@ def query_publications(
         conn.close()
 
 
+def _sanitize_non_finite(value: Any) -> Any:
+    """Replace NaN/Infinity inside a decoded payload with readable labels.
+
+    Quarantined legacy payloads still carry non-finite floats; the UI must be
+    able to display (and clearly mark) them instead of receiving ``null``.
+    """
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            if math.isnan(value):
+                return "NaN"
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, dict):
+        return {k: _sanitize_non_finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_non_finite(v) for v in value]
+    return value
+
+
 def _publication_item(row) -> dict:
-    payload = json.loads(row["payload"])
+    try:
+        payload = json.loads(row["payload"])
+    except (ValueError, TypeError):
+        payload = None
+    reason = row["quarantine_reason"] if "quarantine_reason" in row.keys() else None
     return {
         "publication_id": row["id"],
         "probe_id": row["probe_id"],
@@ -256,8 +337,13 @@ def _publication_item(row) -> dict:
         "day_utc": day_to_iso(row["day"]),
         "data_version": row["data_version"],
         "status": row["status"],
+        "quarantined": row["status"] == "quarantined" or reason is not None,
+        "quarantine_reason": reason,
         "created_at": row["created_at"],
-        "payload": payload,
+        # Strict-JSON-safe: non-finite values (only possible on quarantined
+        # rows) become explicit labels rather than being dropped to null.
+        "payload": _sanitize_non_finite(payload),
+        "payload_readable": payload is not None,
     }
 
 
@@ -270,6 +356,45 @@ def get_publication(probe_id: str, day: str, include_history: bool = False) -> d
             content={"error": f"探头 {probe_id} 在 {day} 没有已发布版本"},
         )
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Pollution / quarantine report (legacy non-finite data)
+# --------------------------------------------------------------------------- #
+@app.get("/api/quarantine")
+def get_quarantine_report() -> dict:
+    """List polluted certificates and publications in the current database.
+
+    Quarantined rows are never valid supply data: they are excluded from the
+    default publication view and shown here with probe, UTC day and version so
+    an operator can repair the certificate (PATCH a finite offset) and
+    republish to restore serving.
+    """
+    conn = db.connect()
+    try:
+        report = db.quarantine_report(conn)
+        certs = [_certificate_item(r) for r in report["certificates"]]
+        pubs = []
+        for r in report["publications"]:
+            pubs.append(
+                {
+                    "publication_id": r["id"],
+                    "probe_id": r["probe_id"],
+                    "day": r["day"],
+                    "day_utc": day_to_iso(r["day"]),
+                    "data_version": r["data_version"],
+                    "status": r["status"],
+                    "quarantine_reason": r["quarantine_reason"],
+                }
+            )
+        return {
+            "polluted_certificates": certs,
+            "polluted_publications": pubs,
+            "certificate_count": len(certs),
+            "publication_count": len(pubs),
+        }
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #

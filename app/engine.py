@@ -9,6 +9,7 @@ state of readings and certificates.
 """
 from __future__ import annotations
 
+import math
 from bisect import bisect_right
 from collections import namedtuple
 
@@ -79,7 +80,18 @@ def compute_day(
                 f"overlapping calibration certificates for probe {probe_id}"
             )
 
-    by_minute = {r.minute: float(r.temperature_c) for r in in_day}
+    by_minute = {}
+    for r in in_day:
+        raw = float(r.temperature_c)
+        if not math.isfinite(raw):
+            # Readings are validated on import, but a legacy/polluted row may
+            # still reach recomputation: fail loudly instead of publishing
+            # unreadable non-finite temperatures.
+            raise ComputeError(
+                f"探头 {probe_id} 在分钟 {r.minute} 的原始读数非有限值 "
+                f"({minute_to_iso(r.minute)})，无法校准计算"
+            )
+        by_minute[r.minute] = raw
     minutes = sorted(by_minute)
 
     uncalibrated: list[int] = []
@@ -89,7 +101,25 @@ def compute_day(
         if offset is None:
             uncalibrated.append(minute)
         else:
-            calibrated.append((minute, by_minute[minute] + offset))
+            if not math.isfinite(offset):
+                # A non-finite certificate offset (legacy polluted row) makes
+                # every covered minute uncomputable. The service layer rejects
+                # such offsets on write, so this only fires for old data.
+                raise ComputeError(
+                    f"探头 {probe_id} 在分钟 {minute} ({minute_to_iso(minute)}) "
+                    f"命中的校准证书偏移为非有限值，无法校准计算"
+                )
+            value = by_minute[minute] + offset
+            if not math.isfinite(value):
+                # Finite inputs may still overflow when summed (e.g. two huge
+                # finite values). The recomputation must fail rather than emit
+                # Infinity into a publication payload.
+                raise ComputeError(
+                    f"探头 {probe_id} 在分钟 {minute} ({minute_to_iso(minute)}) "
+                    f"校准后温度非有限值（原始 {by_minute[minute]} + 偏移 {offset}），"
+                    "重算失败"
+                )
+            calibrated.append((minute, value))
 
     segments: list[dict] = []
     run: list[tuple[int, float]] = []
